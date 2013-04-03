@@ -1,0 +1,7 @@
+name: AutoRefereeUHC
+main: org.mctourney.autoreferee.AutoRefereeUHC
+version: 0.1
+author: authorblues
+
+depend:
+  - AutoReferee
