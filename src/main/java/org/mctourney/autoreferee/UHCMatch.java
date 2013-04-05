@@ -1,12 +1,12 @@
 package org.mctourney.autoreferee;
 
-import java.util.List;
 import java.util.LinkedList;
 import java.util.Collections;
 import java.util.Comparator;
 
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.command.CommandSender;
@@ -19,22 +19,47 @@ import org.mctourney.autoreferee.regions.CuboidRegion;
 
 public class UHCMatch extends AutoRefMatch
 {
-	// size of a default
+	// size of a default UHC match in blocks
 	public static final int DEFAULT_SIZE = 1024;
 
+	// convert players who are eliminated into spectators?
 	protected boolean losersBecomeSpectators = false;
 
+	// is this world currently accepting players (preload complete?)
 	protected boolean acceptingPlayers = false;
 
+	// match creator - receives updates on load progress
+	private CommandSender creator = null;
+
+	// world region (all players share this region)
+	private AutoRefRegion matchRegion = null;
+
+	// world generation task
 	private WorldPregenerationTask worldgen = null;
 
-	public class WorldPregenerationTask extends BukkitRunnable
+	/**
+	 * Reason for world pregeneration being paused.
+	 */
+	private enum PauseReason
 	{
-		private static final int CHUNKS_PER_STEP = 1;
+		MEMORY, USER;
+	}
+
+	private class WorldPregenerationTask extends BukkitRunnable
+	{
+		private static final int CHUNKS_PER_STEP = 4;
+
+		public static final int MINIMUM_MEMORY = 10 * 1024; // 10 kb
+
+		private static final int PRELOAD_CHUNK_RADIUS = 3;
+
+		private PauseReason pause = null;
 
 		private int totalChunks = 0;
 
-		public CommandSender recipient = null;
+		public int speed = CHUNKS_PER_STEP;
+
+		public long startTime = 0L;
 
 		private LinkedList<Chunk> chunkQueue = Lists.newLinkedList();
 
@@ -57,15 +82,19 @@ public class UHCMatch extends AutoRefMatch
 		{
 			for (int x = -radius; x <= radius; ++x)
 			for (int z = -radius; z <= radius; ++z)
-				this.chunkQueue.add(w.getChunkAt(x, z));
+			{
+				Chunk chunk = w.getChunkAt(x, z);
+				this.chunkQueue.add(chunk);
+			}
 
 			this.totalChunks = this.chunkQueue.size();
 
 			// sort chunks on distance to spawn
 			Collections.sort(chunkQueue, new ChunkSorter());
+			this.startTime = System.currentTimeMillis();
 		}
 
-		private WorldPregenerationTask(AutoRefRegion region)
+		public WorldPregenerationTask(AutoRefRegion region)
 		{
 			CuboidRegion bound = region.getBoundingCuboid();
 
@@ -77,28 +106,74 @@ public class UHCMatch extends AutoRefMatch
 
 			for (int x = bmin.getX(); x <= bmax.getX(); ++x)
 			for (int z = bmin.getZ(); z <= bmax.getZ(); ++z)
-				this.chunkQueue.add(w.getChunkAt(x, z));
+			{
+				Chunk chunk = w.getChunkAt(x, z);
+				this.chunkQueue.add(chunk);
+			}
 
 			this.totalChunks = this.chunkQueue.size();
 
 			// sort chunks on distance to spawn
 			Collections.sort(chunkQueue, new ChunkSorter());
+			this.startTime = System.currentTimeMillis();
 		}
+
+		public void setPaused(boolean pause)
+		{ this.pause = pause ? PauseReason.USER : null; }
 
 		@Override
 		public void run()
 		{
+			// just quit immediately if paused by user
+			if (pause == PauseReason.USER) return;
+
+			if (Runtime.getRuntime().freeMemory() < MINIMUM_MEMORY)
+			{
+				// notify the users that we are pausing the world generation
+				if (pause != PauseReason.MEMORY) this.notify(
+					ChatColor.DARK_GRAY + "Waiting for additional memory.");
+
+				pause = PauseReason.MEMORY;
+				return;
+			}
+
+			if (pause != null) this.notify(
+				ChatColor.DARK_GRAY + "Resuming world generation...");
+			pause = null;
+
 			// load a batch of chunks
+			int prc_before = (this.totalChunks - this.chunkQueue.size()) * 100 / this.totalChunks;
 			for (int i = CHUNKS_PER_STEP; i > 0 && this.chunkQueue.size() > 0; --i)
-				this.chunkQueue.removeFirst().load(true);
+			{
+				// load and unload a chunk to force it to generate
+				Chunk chunk = this.chunkQueue.removeFirst();
+				chunk.load(true); chunk.unload();
 
-			int percent = (this.totalChunks - this.chunkQueue.size()) * 100 / this.totalChunks;
-			String update = String.format("%d%% chunks generated", percent);
-			UHCMatch.this.broadcast(ChatColor.DARK_GRAY + update);
+				if (!UHCMatch.this.acceptingPlayers)
+				{
+					int distance = Math.max(Math.abs(chunk.getX()), Math.abs(chunk.getZ()));
+					if (this.chunkQueue.isEmpty()) UHCMatch.this.worldPreloadComplete();
+				}
+			}
 
-			if (this.recipient != null && (!(this.recipient instanceof Player) 
-				|| ((Player) this.recipient).getWorld() != UHCMatch.this.getWorld()))
-					this.recipient.sendMessage(ChatColor.DARK_GRAY + update);
+			float taken = (System.currentTimeMillis() - startTime) / 1000.0f;
+			float workremaining = this.chunkQueue.size() / (float) this.totalChunks;
+			int sec = (int) Math.floor(taken * workremaining / (1.0f - workremaining));
+
+			int prc_after = (this.totalChunks - this.chunkQueue.size()) * 100 / this.totalChunks;
+			String update = String.format("%d%% chunks generated (~%02d:%02d remaining)", prc_after, sec/60, sec%60);
+			if (prc_after / 10 != prc_before / 10) this.notify(ChatColor.GRAY + update);
+		}
+
+		private void notify(String message)
+		{
+			message += String.format(" [%d KB remaining]", Runtime.getRuntime().freeMemory());
+			UHCMatch.this.broadcast(message);
+
+			// if the creator is not yet in this world, send update directly
+			if (UHCMatch.this.creator instanceof Player &&
+				((Player) UHCMatch.this.creator).getWorld() != UHCMatch.this.getWorld())
+					UHCMatch.this.creator.sendMessage(message);
 		}
 	}
 
@@ -112,8 +187,45 @@ public class UHCMatch extends AutoRefMatch
 		// chunks), then divide by 2 to convert diameter to radius.
 		this.worldgen = new WorldPregenerationTask(world, size/32);
 		this.worldgen.runTaskTimer(AutoRefereeUHC.getInstance(), 0L, 20L);
+
+		this.addStartRegion(new CuboidRegion(this.getWorld(),
+			-20, 20, -20, 20, 0, this.getWorld().getMaxHeight()));
+		this.setWorldSpawn(new Location(this.getWorld(),
+			0, this.getWorld().getHighestBlockYAt(0, 0), 0));
+
+		this.addRegion(this.matchRegion = new CuboidRegion(this.getWorld(),
+			-size/2, size/2, -size/2, size/2, 0, this.getWorld().getMaxHeight()));
 	}
 
-	public void setNotificationRecipient(CommandSender recp)
-	{ if (this.worldgen != null) this.worldgen.recipient = recp; }
+	@Override
+	protected void loadWorldConfiguration()
+	{
+	}
+
+	@Override
+	public void saveWorldConfiguration()
+	{
+	}
+
+	public UHCMatch setCreator(CommandSender creator)
+	{ this.creator = creator; return this; }
+
+	public UHCMatch setLoadSpeed(int speed)
+	{ if (this.worldgen != null) this.worldgen.speed = speed; return this; }
+
+	public void pauseWorldGen()
+	{ if (this.worldgen != null) this.worldgen.setPaused(true); }
+
+	public void unpauseWorldGen()
+	{ if (this.worldgen != null) this.worldgen.setPaused(false); }
+
+	private void worldPreloadComplete()
+	{
+		if (this.creator instanceof Player)
+			this.joinMatch((Player) this.creator);
+		this.acceptingPlayers = true;
+
+		this.worldgen.cancel();
+		this.worldgen = null;
+	}
 }

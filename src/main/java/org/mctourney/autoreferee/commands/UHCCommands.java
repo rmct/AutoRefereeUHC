@@ -26,7 +26,7 @@ public class UHCCommands implements CommandHandler
 		this.plugin = (AutoReferee) plugin;
 	}
 
-	@AutoRefCommand(name={"autoref", "uhc"}, argmax=0, options="s+g+z+",
+	@AutoRefCommand(name={"autoref", "loaduhc"}, argmax=0, options="s+g+z+t+",
 		description="Load a UHC match.")
 	@AutoRefPermission(console=true, nodes={"autoreferee.admin"})
 
@@ -57,9 +57,14 @@ public class UHCCommands implements CommandHandler
 
 		// TODO Custom Generator
 
-		// TODO Move this to a sync thread
-		match = new UHCMatch(Bukkit.createWorld(creator), size, true);
-		plugin.addMatch(match);
+		UHCMatch uhcMatch = new UHCMatch(Bukkit.createWorld(creator), size, true).setCreator(sender);
+
+		// specify number of chunks to load per step
+		if (options.hasOption('t'))
+			try { uhcMatch.setLoadSpeed(Integer.parseInt(options.getOptionValue('t'))); }
+			catch (NumberFormatException e) { e.printStackTrace(); }
+
+		plugin.addMatch(uhcMatch);
 		return true;
 	}
 }
